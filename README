@@ -1,3 +1,58 @@
+*WARNING WARNING WARNING WARNING WARNING WARNING WARNING WARNING*
+This copy of gnupg has been patched in such a way that key generation
+for anything *other* than vanity keys is horribly slow and, unless
+generating Curve25519 EdDSA keys, broken. DO NOT INSTALL ON ANY SYSTEM.
+Compile & use from the build dir.
+
+(Generating vanity keys is also "horribly slow" for certain definitions
+of slow. Hitting a 32-bit vanity keyid can be done in a matter of hours
+on a decent machine.)
+
+
+Usage: Change the if-statements in agent/genkey.c and g10/keygen.c to
+reflect your choice of 32-bit keyid. Of course, feel free to use bit
+masking to go for shorter matches - a 24-bit keyid substring takes
+on average about 3 minutes to generate hit on my machine.
+
+Then, configure. My configure line looks like this:
+        ./configure \
+                --prefix=/usr \
+                --sysconfdir=/etc \
+                --sbindir=/usr/bin \
+                --libexecdir=/usr/lib/gnupg \
+                --enable-maintainer-mode \
+                --enable-symcryptrun \
+                --enable-gpgtar
+
+Now, make. DO NOT MAKE INSTALL. Just make.
+
+Edit vanity/batchparams to reflect the desired contents of the key.
+
+Now, run an external entropy gathering deamon like rngd. If that isn't
+enough, under linux, consider replacing /dev/random with the /dev/urandom
+character device (rm /dev/random; mknod /dev/random c 1 9), but only
+*after* sufficiently seeding the entropy pool using e.g. rngd. Blocking
+/dev/random and entropy estimation are laughable as long as the entropy
+pool has been thoroughly seeded. For an extensive explanation why this is,
+see <http://www.2uo.de/myths-about-urandom/>.
+
+Make sure that directories .gnupg{1..4} are present in the directory
+from where you run startagents.sh and generate.sh, and that they are
+chmod 700.
+
+Don't forget to change the crappy passphrase. Enjoy your keys.
+
+
+NOTE: As you can see by inspecting the code, I've copied over some
+pretty big chunks of code from g10 (gpg2) to agent (gpg-agent) to
+enable the agent to create a corresponding public key and extract
+the keyid. Be careful when using this on a different version of gnupg;
+ensure that the duplicated code in agent is correct w.r.t. the
+corresponding code in g10.
+
+
+
+
                        The GNU Privacy Guard 2
                       =========================
                              Version 2.1

@@ -30,6 +30,312 @@
 #include "exechelp.h"
 #include "sysutils.h"
 
+// EDITED FOR VANITY
+#include "common/openpgpdefs.h"
+#define MAX_FINGERPRINT_LEN 20
+typedef struct kbnode_struct *KBNODE;
+typedef struct kbnode_struct *kbnode_t;
+#include "g10/packet.h"
+#include "g10/keydb.h"
+
+// Copied a bunch of functions required for fingerprint calculation.
+
+// from g10/keygen.c:
+static gpg_error_t
+ecckey_from_sexp (gcry_mpi_t *array, gcry_sexp_t sexp, int algo)
+{
+  gpg_error_t err;
+  gcry_sexp_t list, l2;
+  char *curve;
+  int i;
+  const char *oidstr;
+  unsigned int nbits;
+
+  array[0] = NULL;
+  array[1] = NULL;
+  array[2] = NULL;
+
+  list = gcry_sexp_find_token (sexp, "public-key", 0);
+  if (!list)
+    return gpg_error (GPG_ERR_INV_OBJ);
+  l2 = gcry_sexp_cadr (list);
+  gcry_sexp_release (list);
+  list = l2;
+  if (!list)
+    return gpg_error (GPG_ERR_NO_OBJ);
+
+  l2 = gcry_sexp_find_token (list, "curve", 0);
+  if (!l2)
+    {
+      err = gpg_error (GPG_ERR_NO_OBJ);
+      goto leave;
+    }
+  curve = gcry_sexp_nth_string (l2, 1);
+  if (!curve)
+    {
+      err = gpg_error (GPG_ERR_NO_OBJ);
+      goto leave;
+    }
+  gcry_sexp_release (l2);
+  oidstr = openpgp_curve_to_oid (curve, &nbits);
+  if (!oidstr)
+    {
+      /* That can't happen because we used one of the curves
+         gpg_curve_to_oid knows about.  */
+      err = gpg_error (GPG_ERR_INV_OBJ);
+      goto leave;
+    }
+  err = openpgp_oid_from_str (oidstr, &array[0]);
+  if (err)
+    goto leave;
+
+  l2 = gcry_sexp_find_token (list, "q", 0);
+  if (!l2)
+    {
+      err = gpg_error (GPG_ERR_NO_OBJ);
+      goto leave;
+    }
+  array[1] = gcry_sexp_nth_mpi (l2, 1, GCRYMPI_FMT_USG);
+  gcry_sexp_release (l2);
+  if (!array[1])
+    {
+      err = gpg_error (GPG_ERR_INV_OBJ);
+      goto leave;
+    }
+  gcry_sexp_release (list);
+
+  if (algo == PUBKEY_ALGO_ECDH)
+    {
+      // Removed this body, shouldn't be hit anyway.
+      log_debug("ONLY USE THIS WITH EDDSA!\n");
+      BUG();
+    }
+
+ leave:
+  if (err)
+    {
+      for (i=0; i < 3; i++)
+        {
+          gcry_mpi_release (array[i]);
+          array[i] = NULL;
+        }
+    }
+  return err;
+}
+
+// from common/host2net.h:
+static inline u32
+buf32_to_u32 (const void *buffer)
+{
+  const unsigned char *p = buffer;
+
+  return (((u32)p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3]);
+}
+
+// from g10/keyid.c:
+/* Hash a public key.  This function is useful for v4 fingerprints and
+   for v3 or v4 key signing. */
+void
+hash_public_key (gcry_md_hd_t md, PKT_public_key *pk)
+{
+  unsigned int n = 6;
+  unsigned int nn[PUBKEY_MAX_NPKEY];
+  byte *pp[PUBKEY_MAX_NPKEY];
+  int i;
+  unsigned int nbits;
+  size_t nbytes;
+  int npkey = 2; // VANITY: Hardcoded pubkey_algo to EDDSA from
+                 // pubkey_get_npkey in g10/misc.c
+
+  /* FIXME: We can avoid the extra malloc by calling only the first
+     mpi_print here which computes the required length and calling the
+     real mpi_print only at the end.  The speed advantage would only be
+     for ECC (opaque MPIs) or if we could implement an mpi_print
+     variant with a callback handler to do the hashing.  */
+  if (npkey==0 && pk->pkey[0]
+      && gcry_mpi_get_flag (pk->pkey[0], GCRYMPI_FLAG_OPAQUE))
+    {
+      pp[0] = gcry_mpi_get_opaque (pk->pkey[0], &nbits);
+      nn[0] = (nbits+7)/8;
+      n+=nn[0];
+    }
+  else
+    {
+      for (i=0; i < npkey; i++ )
+        {
+          if (!pk->pkey[i])
+            {
+              /* This case may only happen if the parsing of the MPI
+                 failed but the key was anyway created.  May happen
+                 during "gpg KEYFILE".  */
+              pp[i] = NULL;
+              nn[i] = 0;
+            }
+          else if (gcry_mpi_get_flag (pk->pkey[i], GCRYMPI_FLAG_OPAQUE))
+            {
+              const void *p;
+
+              p = gcry_mpi_get_opaque (pk->pkey[i], &nbits);
+              pp[i] = xmalloc ((nbits+7)/8);
+              if (p)
+                memcpy (pp[i], p, (nbits+7)/8);
+              else
+                pp[i] = NULL;
+              nn[i] = (nbits+7)/8;
+              n += nn[i];
+            }
+          else
+            {
+              if (gcry_mpi_print (GCRYMPI_FMT_PGP, NULL, 0,
+                                  &nbytes, pk->pkey[i]))
+                BUG ();
+              pp[i] = xmalloc (nbytes);
+              if (gcry_mpi_print (GCRYMPI_FMT_PGP, pp[i], nbytes,
+                                  &nbytes, pk->pkey[i]))
+                BUG ();
+              nn[i] = nbytes;
+              n += nn[i];
+            }
+        }
+    }
+
+  gcry_md_putc ( md, 0x99 );     /* ctb */
+  /* What does it mean if n is greater than than 0xFFFF ? */
+  gcry_md_putc ( md, n >> 8 );   /* 2 byte length header */
+  gcry_md_putc ( md, n );
+  gcry_md_putc ( md, pk->version );
+
+  gcry_md_putc ( md, pk->timestamp >> 24 );
+  gcry_md_putc ( md, pk->timestamp >> 16 );
+  gcry_md_putc ( md, pk->timestamp >>  8 );
+  gcry_md_putc ( md, pk->timestamp       );
+
+  gcry_md_putc ( md, pk->pubkey_algo );
+
+  if(npkey==0 && pk->pkey[0]
+     && gcry_mpi_get_flag (pk->pkey[0], GCRYMPI_FLAG_OPAQUE))
+    {
+      if (pp[0])
+        gcry_md_write (md, pp[0], nn[0]);
+    }
+  else
+    {
+      for(i=0; i < npkey; i++ )
+        {
+          if (pp[i])
+            gcry_md_write ( md, pp[i], nn[i] );
+          xfree(pp[i]);
+        }
+    }
+}
+
+// from g10/keyid.c:
+static gcry_md_hd_t
+do_fingerprint_md( PKT_public_key *pk )
+{
+  gcry_md_hd_t md;
+
+  if (gcry_md_open (&md, DIGEST_ALGO_SHA1, 0))
+    BUG ();
+  hash_public_key(md,pk);
+  gcry_md_final( md );
+
+  return md;
+}
+
+
+// from g10/keyid.c:
+/*
+ * Get the keyid from the public key and put it into keyid
+ * if this is not NULL. Return the 32 low bits of the keyid.
+ */
+u32
+keyid_from_pk (PKT_public_key *pk, u32 *keyid)
+{
+  u32 lowbits;
+  u32 dummy_keyid[2];
+
+  if (!keyid)
+    keyid = dummy_keyid;
+
+  if( pk->keyid[0] || pk->keyid[1] )
+    {
+      keyid[0] = pk->keyid[0];
+      keyid[1] = pk->keyid[1];
+      lowbits = keyid[1];
+    }
+  else
+    {
+      const byte *dp;
+      gcry_md_hd_t md;
+
+      md = do_fingerprint_md(pk);
+      if(md)
+        {
+          dp = gcry_md_read ( md, 0 );
+          keyid[0] = buf32_to_u32 (dp+12);
+          keyid[1] = buf32_to_u32 (dp+16);
+          lowbits = keyid[1];
+          gcry_md_close (md);
+          pk->keyid[0] = keyid[0];
+          pk->keyid[1] = keyid[1];
+        }
+      else
+        pk->keyid[0]=pk->keyid[1]=keyid[0]=keyid[1]=lowbits=0xFFFFFFFF;
+    }
+
+  return lowbits;
+}
+
+
+
+// from g10/keyid.c:
+/*
+ * Return a byte array with the fingerprint for the given PK/SK
+ * The length of the array is returned in ret_len. Caller must free
+ * the array or provide an array of length MAX_FINGERPRINT_LEN.
+ */
+byte *
+fingerprint_from_pk (PKT_public_key *pk, byte *array, size_t *ret_len)
+{
+  const byte *dp;
+  size_t len;
+  gcry_md_hd_t md;
+
+  md = do_fingerprint_md(pk);
+  dp = gcry_md_read( md, 0 );
+  len = gcry_md_get_algo_dlen (gcry_md_get_algo (md));
+  assert( len <= MAX_FINGERPRINT_LEN );
+  if (!array)
+    array = xmalloc ( len );
+  memcpy (array, dp, len );
+  pk->keyid[0] = buf32_to_u32 (dp+12);
+  pk->keyid[1] = buf32_to_u32 (dp+16);
+  gcry_md_close( md);
+
+  if (ret_len)
+    *ret_len = len;
+  return array;
+}
+
+
+// from g10/keyid.c:
+/* Return an allocated buffer with the fingerprint of PK formatted as
+   a plain hexstring.  */
+char *
+hexfingerprint (PKT_public_key *pk)
+{
+  unsigned char fpr[MAX_FINGERPRINT_LEN];
+  size_t len;
+  char *result;
+
+  fingerprint_from_pk (pk, fpr, &len);
+  result = xmalloc (2 * len + 1);
+  bin2hex (fpr, len, result);
+  return result;
+}
+// VANITY EDITS END
+
 static int
 store_key (gcry_sexp_t private, const char *passphrase, int force,
 	unsigned long s2k_count)
@@ -423,6 +729,37 @@ agent_genkey (ctrl_t ctrl, const char *cache_nonce,
   int rc;
   size_t len;
   char *buf;
+  // EDITED FOR VANITY
+  int match = 0; // Loop guard, if match, break out.
+  long long unsigned int iterations = 0; // Count iterations.
+  int err;
+  int algo = PUBKEY_ALGO_EDDSA;
+  // Timestamp range for bruteforcing:
+  u32 timestamp = make_timestamp ();
+  u32 tmpstamp = timestamp;
+  u32 lowertime = timestamp - 2000000;
+  // keyid and fingerprint storage:
+  u32 keyid;
+  byte *fp;
+  // dummy pubkey to determine current fingerprint:
+  PKT_public_key *pk;
+  pk = xtrycalloc (1, sizeof *pk);
+  if (!pk)
+    {
+      err = gpg_error_from_syserror ();
+      gcry_sexp_release (s_key);
+      return err;
+    }
+
+  log_debug("Starting key generation\n");
+  // Fill out the relevant values in the dummy pubkey.
+  pk->timestamp = timestamp;
+  pk->version = 4;
+  pk->pubkey_algo = algo;
+
+  // allocate storage for fingerprint calculations.
+  fp = xmalloc (MAX_FINGERPRINT_LEN);
+  // VANITY EDITS END
 
   rc = gcry_sexp_sscan (&s_keyparam, NULL, keyparam, keyparamlen);
   if (rc)
@@ -455,34 +792,82 @@ agent_genkey (ctrl_t ctrl, const char *cache_nonce,
       passphrase = passphrase_buffer;
     }
 
-  rc = gcry_pk_genkey (&s_key, s_keyparam );
-  gcry_sexp_release (s_keyparam);
-  if (rc)
-    {
-      log_error ("key generation failed: %s\n", gpg_strerror (rc));
-      xfree (passphrase_buffer);
-      return rc;
+  // EDITED FOR VANITY
+  while (match == 0) {
+    // start looping over generation.
+    // VANITY EDITS END
+  
+    rc = gcry_pk_genkey (&s_key, s_keyparam );
+    // EDITED FOR VANITY
+    // Do not release the keyparam, we need it again in the loop.
+    //gcry_sexp_release (s_keyparam);
+    // VANITY EDITS END
+    if (rc)
+      {
+        log_error ("key generation failed: %s\n", gpg_strerror (rc));
+        xfree (passphrase_buffer);
+        return rc;
+      }
+  
+    /* break out the parts */
+    s_private = gcry_sexp_find_token (s_key, "private-key", 0);
+    if (!s_private)
+      {
+        log_error ("key generation failed: invalid return value\n");
+        gcry_sexp_release (s_key);
+        xfree (passphrase_buffer);
+        return gpg_error (GPG_ERR_INV_DATA);
+      }
+    s_public = gcry_sexp_find_token (s_key, "public-key", 0);
+    if (!s_public)
+      {
+        log_error ("key generation failed: invalid return value\n");
+        gcry_sexp_release (s_private);
+        gcry_sexp_release (s_key);
+        xfree (passphrase_buffer);
+        return gpg_error (GPG_ERR_INV_DATA);
+      }
+    gcry_sexp_release (s_key); s_key = NULL;
+  
+    // EDITED FOR VANITY
+    // Generate an ecc public key from the public part.
+    err = ecckey_from_sexp (pk->pkey, s_public, algo);
+    if (err)
+      {
+        log_error ("key_from_sexp failed: %s\n", gpg_strerror (err) );
+        gcry_sexp_release (s_public);
+        //free_public_key (pk); // Vanity: This function doesn't exist here.
+                                // Accept the minor memory leak.
+        return err;
+      }
+  
+    // Range over 2 million generation seconds between the past and now.
+    for (tmpstamp = lowertime; tmpstamp <= timestamp; ++tmpstamp) {
+      pk->timestamp = tmpstamp;
+      fp = fingerprint_from_pk(pk, fp, NULL);
+      keyid = keyid_from_pk(pk, NULL);
+      ++iterations;
+      /*if ((keyid & 0xFFFF) == 0xCAFE ||
+          (keyid & 0xFFFF000) == 0xF00D000 {*/
+      if (keyid == 0xF00DF00D ||
+          keyid == 0xDEADBEEF) {
+        match = 1; // Not really needed anymore since the goto.
+        goto store; // Break out of double loop, prevent releasing of s_private
+                    // and s_public.
+      } else {
+        if (iterations % 1000000 == 0) {
+          log_debug("Progressed through %llu iterations.\n", iterations);
+        }
+      }
     }
+    gcry_sexp_release (s_private);
+    gcry_sexp_release (s_public);
+  }
 
-  /* break out the parts */
-  s_private = gcry_sexp_find_token (s_key, "private-key", 0);
-  if (!s_private)
-    {
-      log_error ("key generation failed: invalid return value\n");
-      gcry_sexp_release (s_key);
-      xfree (passphrase_buffer);
-      return gpg_error (GPG_ERR_INV_DATA);
-    }
-  s_public = gcry_sexp_find_token (s_key, "public-key", 0);
-  if (!s_public)
-    {
-      log_error ("key generation failed: invalid return value\n");
-      gcry_sexp_release (s_private);
-      gcry_sexp_release (s_key);
-      xfree (passphrase_buffer);
-      return gpg_error (GPG_ERR_INV_DATA);
-    }
-  gcry_sexp_release (s_key); s_key = NULL;
+store:
+  log_debug("Hit desired key %X after %llu iterations!\n", keyid, iterations);
+  gcry_sexp_release (s_keyparam);
+  // VANITY EDITS END
 
   /* store the secret key */
   if (DBG_CRYPTO)

@@ -1294,6 +1294,14 @@ common_gen (const char *keyparms, int algo, const char *algoelem,
   PACKET *pkt;
   PKT_public_key *pk;
   gcry_sexp_t s_key;
+  // EDITED FOR VANITY
+  // Set up fingerprint and timestamp-ranging for bruteforcing keyid.
+  u32 lowertime = timestamp - 2000000;
+  byte *fp;
+  u32 keyid;
+
+  fp = xmalloc (MAX_FINGERPRINT_LEN);
+  // VANITY EDITS END
 
   err = agent_genkey (NULL, cache_nonce_addr, keyparms,
                       !!(keygen_flags & KEYGEN_FLAG_NO_PROTECTION),
@@ -1313,25 +1321,40 @@ common_gen (const char *keyparms, int algo, const char *algoelem,
       return err;
     }
 
-  pk->timestamp = timestamp;
+  // EDITED FOR VANITY
+  // Version, algorithm, and public key material don't change.
   pk->version = 4;
-  if (expireval)
-    pk->expiredate = pk->timestamp + expireval;
   pk->pubkey_algo = algo;
+  // However, range over timestamp to bruteforce the timestamp found by agent.
+  for (; lowertime <= timestamp; ++lowertime) {
+    pk->timestamp = lowertime;
+    if (expireval)
+      pk->expiredate = pk->timestamp + expireval;
 
-  if (algo == PUBKEY_ALGO_ECDSA
-      || algo == PUBKEY_ALGO_EDDSA
-      || algo == PUBKEY_ALGO_ECDH )
-    err = ecckey_from_sexp (pk->pkey, s_key, algo);
-  else
-    err = key_from_sexp (pk->pkey, s_key, "public-key", algoelem);
-  if (err)
-    {
-      log_error ("key_from_sexp failed: %s\n", gpg_strerror (err) );
-      gcry_sexp_release (s_key);
-      free_public_key (pk);
-      return err;
+    // algo should always only be PUBKEY_ALGO_EDDSA for this.
+    if (algo == PUBKEY_ALGO_EDDSA) {
+      err = ecckey_from_sexp (pk->pkey, s_key, algo);
+    } else {
+      log_debug("ONLY USE THIS WITH EDDSA!\n");
+      BUG();
     }
+    if (err)
+      {
+        log_error ("key_from_sexp failed: %s\n", gpg_strerror (err) );
+        gcry_sexp_release (s_key);
+        free_public_key (pk);
+        return err;
+      }
+    fp = fingerprint_from_pk(pk, fp, NULL);
+    keyid = keyid_from_pk(pk, NULL);
+    /*if ((keyid & 0xFFFF) == 0xCAFE ||
+        (keyid & 0xFFFF000) == 0xF00D000 {*/
+    if (keyid == 0xF00DF00D ||
+        keyid == 0xDEADBEEF) {
+      break;
+    }
+  }
+  // VANITY EDITS END
   gcry_sexp_release (s_key);
 
   pkt = xtrycalloc (1, sizeof *pkt);
@@ -4043,6 +4066,10 @@ do_generate_keypair (struct para_data_s *para,
     {
       pri_psk = pub_root->next->pkt->pkt.public_key;
       assert (pri_psk);
+      // EDITED FOR VANITY
+      // Retrieve bruteforced timestamp from key packet.
+      timestamp = pri_psk->timestamp;
+      // VANITY EDITS END
     }
 
   if (!err && (revkey = get_parameter_revkey (para, pREVOKER)))

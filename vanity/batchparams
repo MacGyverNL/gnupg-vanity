@@ -1,0 +1,8 @@
+Key-Type: EDDSA
+Key-Curve: Ed25519
+Key-Usage: sign
+Passphrase: 123456789
+Name-Real: Your Real Name Here
+Name-Email: you@example.exm
+Expire-Date: 1y
+Preferences: SHA512 SHA384 SHA256 SHA224 AES256 AES192 AES TWOFISH CAST5 IDEA ZLIB BZIP2 ZIP Uncompressed
